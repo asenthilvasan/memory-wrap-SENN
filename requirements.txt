@@ -5,3 +5,4 @@ pillow
 absl-py
 captum
 memorywrap
+wandb

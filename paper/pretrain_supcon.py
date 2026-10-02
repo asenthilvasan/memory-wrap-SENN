@@ -22,21 +22,22 @@ Usage:
     python pretrain_supcon.py --loss=hybrid          # SupCon + SimCLR (50/50)
     python pretrain_supcon.py --loss=hybrid --hybrid_alpha=0.7  # 70% supcon
     python pretrain_supcon.py --model=resnet18 --epochs=200
-    # Same-data-budget pretraining: only see the 2000 images the downstream
-    # Memory Wrap stage will see (matches config/train.yaml train_examples).
-    python pretrain_supcon.py --train_examples=2000 --seed=1
-    # Disable the 2-layer MLP projection head (legacy / ablation behaviour:
-    # apply contrastive loss directly to encoder features). Default is 128.
-    python pretrain_supcon.py --projection_dim=0
+    # Same-data-budget pretraining: only see the 2000 images that downstream
+    # run 3 (seed 3) will see. Pretrain one encoder per downstream seed.
+    python pretrain_supcon.py --train_examples=2000 --seed=3
+    # Enable the 2-layer MLP projection head (canonical SupCon/SimCLR).
+    python pretrain_supcon.py --projection_dim=128
 
-Output: models/<dataset>/{supcon,simclr,hybrid}/<model>/<train_examples or "full">/1.pt
+Output: models/<dataset>/{supcon,simclr,hybrid}/<model>/<train_examples or "full">/seed<seed>.pt
+(config/pretrain_encoders.sh pretrains every seed of a sweep.)
 
-Plug the checkpoint into downstream Memory Wrap training via:
+Plug the encoders into downstream Memory Wrap training via:
     python train.py --modality=encoder_memory \\
-        --pretrained_encoder=models/<dataset>/<loss>/<model>/<budget>/1.pt \\
+        --pretrained_encoder=models/<dataset>/<loss>/<model>/<budget> \\
         --freeze_encoder=True
 """
 import os
+import sys
 # absl is used for CLI flags to match the convention in train.py.
 import absl.app, absl.flags
 import torch
@@ -52,6 +53,7 @@ from torchvision import datasets, transforms
 # Reuse the existing model factory so SupCon-pretrained checkpoints use the
 # exact same backbone as downstream Memory Wrap training.
 import utils.utils as utils
+import utils.tracking as tracking
 # split_dataset implements the exact same seeded random_split used by the
 # downstream Memory Wrap training pipeline (paper/utils/datasets.py). Reusing
 # it here — with the same seed and per-dataset val_size — guarantees that
@@ -126,14 +128,13 @@ absl.flags.DEFINE_integer('num_workers', 8, 'DataLoader worker processes')
 absl.flags.DEFINE_integer('train_examples', 0,
     'Subset size to pretrain on (0 = full dataset). Match config/train.yaml '
     'train_examples for a same-data-budget comparison with downstream.')
-# Seed controls which images end up in the subset. Must match downstream's
-# seed (train.py iterates runs 1..N and passes seed=run to get_<DATASET>),
-# so to exactly mirror "run 1" use --seed=1; for "run 2" use --seed=2, etc.
-# Default 42 matches the datasets.py default and is fine as a single-run
-# convention.
+# Seed controls which images end up in the subset and the encoder's initial
+# weights. train.py runs seeds 0..runs-1 (saved as 1.pt..N.pt), each on its
+# own subset, and loads the encoder whose seed matches. Using one encoder for
+# every run leaks labels from its subset into the other runs.
 absl.flags.DEFINE_integer('seed', 42,
-    'Seed for the train/val split. Set equal to the downstream run index '
-    '(1..runs) so the pretrain subset matches that run exactly.')
+    'Seed for the train/val split and weight init. Must equal the downstream '
+    'run index (0..runs-1) whose subset this encoder is for.')
 # Output dimension of the 2-layer MLP projection head applied on top of the
 # encoder during pretraining. Standard SupCon/SimCLR practice (Khosla 2020,
 # Chen 2020): apply the contrastive loss to the projection's output, NOT
@@ -298,7 +299,14 @@ def main(argv):
     # so let cuDNN benchmark kernels at startup and pick the fastest for
     # each conv. Free ~5-15% speedup on conv-heavy backbones.
     torch.backends.cudnn.benchmark = True
+    torch.manual_seed(FLAGS.seed)
     spec = DATASET_SPECS[FLAGS.dataset]
+    budget_dir = 'full' if FLAGS.train_examples == 0 else str(FLAGS.train_examples)
+    tracker = tracking.init(
+        name=f'{FLAGS.loss}-seed{FLAGS.seed}',
+        group=f'{FLAGS.dataset}-{budget_dir}-{FLAGS.loss}-pretrain',
+        job_type='pretrain',
+        config={f.name: f.value for f in FLAGS.get_flags_for_module(sys.argv[0])})
 
     # --- Augmentation pipeline ----------------------------------------------
     # SimCLR-style augmentations. They have to be strong enough that two
@@ -363,8 +371,8 @@ def main(argv):
     # vector that Memory Wrap attends over. The self.mw head is PRESENT on
     # the model but never called during pretraining — it stays at random
     # init and receives no gradient updates, so its parameters persist
-    # untouched into the saved checkpoint. Downstream train.py reinitializes
-    # it anyway (or ignores those keys if the modality differs).
+    # untouched into the saved checkpoint. Downstream train.py skips those
+    # keys and keeps its own freshly initialized head.
     model = utils.get_model(FLAGS.model, 10, model_type='encoder_memory').to(device)
 
     # --- Projection head ----------------------------------------------------
@@ -456,6 +464,7 @@ def main(argv):
     # a different LR.
     printed_diag = False
     for ep in range(1, FLAGS.epochs + 1):
+        epoch_loss = 0.0
         for (v1, v2), y in loader:
             # Stack both views into a single tensor of shape [2B, 3, 32, 32].
             # Encoding both views in the same forward pass keeps BatchNorm
@@ -502,6 +511,8 @@ def main(argv):
                       f'per_dim_std(mean)={per_dim_std:.4f}  '
                       f'(mean_cos ~ 1.0 OR per_dim_std ~ 0 => features '
                       f'collapsed; try --projection_bn)', flush=True)
+                tracker.summary['diag/mean_cos'] = mean_cos
+                tracker.summary['diag/per_dim_std'] = per_dim_std
                 printed_diag = True
 
             # scaler.scale: multiplies loss by dynamic scale factor to keep
@@ -512,12 +523,16 @@ def main(argv):
             scaler.step(opt)
             # scaler.update: adjusts the scale factor for next iteration.
             scaler.update()
+            epoch_loss += loss.item()
 
+        mean_loss = epoch_loss / len(loader)
+        lr = opt.param_groups[0]['lr']
         sched.step()  # Cosine schedule steps once per epoch, not per batch.
         # flush=True: when stdout is redirected to a log file Python block-
         # buffers to ~4KB, which with only ~30 chars per print would never
         # flush during a 100-epoch run. Explicit flush keeps logs live.
-        print(f'Epoch {ep}/{FLAGS.epochs}  loss={loss.item():.4f}', flush=True)
+        print(f'Epoch {ep}/{FLAGS.epochs}  loss={mean_loss:.4f}  lr={lr:.4g}', flush=True)
+        tracker.log({'pretrain/loss': mean_loss, 'pretrain/lr': lr, 'epoch': ep})
 
     # --- Save checkpoint ----------------------------------------------------
     # Checkpoint format mirrors what train.py saves: model_name and
@@ -526,24 +541,19 @@ def main(argv):
     # 'modality' key is informational — train.py reads state_dict only.
     # Save path includes both dataset and loss so runs don't clobber each
     # other when pilot-comparing across datasets or objectives.
-    # Include the data budget in the save path so 'full' and budgeted runs
-    # (e.g. 2000) live side-by-side instead of clobbering each other. Using
-    # the string 'full' for the unbudgeted case keeps backward-readable
-    # paths and mirrors the convention in config/train.yaml where 100000
-    # informally means "the whole training set".
-    budget_dir = 'full' if FLAGS.train_examples == 0 else str(FLAGS.train_examples)
-    out = f'models/{FLAGS.dataset}/{FLAGS.loss}/{FLAGS.model}/{budget_dir}/1.pt'
+    # Include the data budget and seed in the save path so 'full' and
+    # budgeted runs, and the encoders for different seeds, live side by side.
+    out = f'models/{FLAGS.dataset}/{FLAGS.loss}/{FLAGS.model}/{budget_dir}/seed{FLAGS.seed}.pt'
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    # Record train_examples + seed in the checkpoint so it's auditable later
-    # (which subset was this encoder trained on?). Downstream train.py only
-    # reads model_state_dict from the pretrained_encoder file, so the extra
-    # keys are harmless metadata.
+    # train.py checks dataset_name, train_examples and seed against the run
+    # before loading, so an encoder can never be used with the wrong subset.
     torch.save({'model_state_dict': model.state_dict(), 'model_name': FLAGS.model,
                 'num_classes': 10, 'modality': f'{FLAGS.loss}_pretrained',
                 'dataset_name': FLAGS.dataset,
                 'train_examples': FLAGS.train_examples,
                 'seed': FLAGS.seed}, out)
     print(f'Saved {out}')
+    tracker.finish()
 
 
 if __name__ == '__main__':

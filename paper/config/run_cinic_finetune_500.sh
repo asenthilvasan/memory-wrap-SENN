@@ -5,10 +5,10 @@
 # UNFROZEN so the SupCon-pretrained features can co-adapt with the
 # downstream head.
 #
-# Prereqs (already satisfied in this workspace):
-#   - paper/models/CINIC10 -> /root/cinic_run/models (symlink)
-#   - SupCon encoder at models/CINIC10/supcon/mobilenet/500/1.pt
-#   - CINIC10 dataset visible at datasets/CINIC10/train (setup_cinic.sh)
+# PREREQUISITE: stage the dataset once with `bash config/setup_cinic.sh`.
+# Reuses the per-seed encoders from run_cinic_ablation_500.sh and pretrains
+# any that are missing. Extra arguments are passed to every python call,
+# e.g. --wandb.
 #
 # LR note: train.yaml ships with lr=1e-1 (from-scratch). For fine-tune we
 # drop to 1e-2 so the SupCon initialization isn't wrecked in the first epoch.
@@ -17,15 +17,14 @@
 
 set -e
 set -o pipefail
-cd /workspace/memory-wrap-SENN/paper
+cd "$(dirname "$0")/.."
 
-ENC=models/CINIC10/supcon/mobilenet/500/1.pt
-LOG=/root/cinic_run_500/logs
+ENC=models/CINIC10/supcon/mobilenet/500
+LOG=logs/cinic_500
 YAML=config/train.yaml
 
 mkdir -p "$LOG"
 
-[ -f "$ENC" ] || { echo "ERROR: missing encoder $ENC" >&2; exit 1; }
 [ -d datasets/CINIC10/train ] || { echo "ERROR: missing datasets/CINIC10/train; run config/setup_cinic.sh" >&2; exit 1; }
 
 cp "$YAML" "${YAML}.bak"
@@ -52,18 +51,24 @@ echo "YAML patched:"
 grep -E "^(dataset_name|train_examples|batch_size_train|  learning_rate):" "$YAML"
 grep -A3 "^CINIC10:" "$YAML" | grep -E "num_epochs|opt_milestones"
 
+RUNS=$(awk '/^runs:/ {print $2}' "$YAML")
+bash config/pretrain_encoders.sh "$ENC" "$RUNS" "$LOG" \
+    --dataset=CINIC10 --loss=supcon --model=mobilenet \
+    --train_examples=500 --epochs=300 --batch_size=64 \
+    --lr=0.125 --temperature=0.07 --projection_dim=0 "$@"
+
 echo "===== Cell 4: SupCon + Linear (fine-tune, encoder UNFROZEN) ====="
 python -u train.py \
     --modality=std \
     --pretrained_encoder=$ENC \
-    --freeze_encoder=False \
+    --freeze_encoder=False "$@" \
     2>&1 | tee $LOG/04_supcon_linear_finetune.txt
 
 echo "===== Cell 6: SupCon + MW (fine-tune, encoder UNFROZEN) ====="
 python -u train.py \
     --modality=encoder_memory \
     --pretrained_encoder=$ENC \
-    --freeze_encoder=False \
+    --freeze_encoder=False "$@" \
     2>&1 | tee $LOG/06_supcon_mw_finetune.txt
 
 echo "===== ALL DONE ====="

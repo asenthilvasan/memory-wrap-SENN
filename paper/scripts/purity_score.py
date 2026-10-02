@@ -35,6 +35,7 @@ import torch
 
 import utils.datasets as datasets
 import utils.utils as utils
+import utils.tracking as tracking
 
 absl.flags.DEFINE_string("path", None, "Dir of .pt files or single .pt path.")
 absl.flags.DEFINE_string("dir_dataset", '../datasets/', "Datasets directory.")
@@ -315,6 +316,10 @@ def run_experiment(path, dataset_dir):
     print(f"Device: {device}", flush=True)
 
     entries_a = _load_model_and_loaders(path, dataset_dir, device)
+    tracker = tracking.init(
+        name=os.path.normpath(path), group='purity', job_type='purity',
+        config={'path': path, 'compare_path': FLAGS.compare_path,
+                'num_redraws': FLAGS.num_redraws, 'max_images': FLAGS.max_images})
 
     # --- comparison mode ---
     if FLAGS.compare_path:
@@ -358,6 +363,9 @@ def run_experiment(path, dataset_dir):
                   f"SoftA:{mean_sa:.4f} SoftB:{mean_sb:.4f} | "
                   f"BothCorrect(avg):{np.mean(ns):.0f}  E:{(time.time()-t0)/60:.2f}min",
                   flush=True)
+            tracker.log({'seed': run_a, 'coherence/path': mean_ca, 'coherence/compare': mean_cb,
+                         'focus/path': mean_fa, 'focus/compare': mean_fb,
+                         'soft/path': mean_sa, 'soft/compare': mean_sb})
 
         print(f"\nSUMMARY (n={len(all_coh_a)}, both-correct queries only) | "
               f"Coherence --path: {np.nanmean(all_coh_a):.4f} +/- {np.nanstd(all_coh_a):.4f} | "
@@ -367,6 +375,12 @@ def run_experiment(path, dataset_dir):
               f"Soft --path: {np.nanmean(all_sft_a):.4f} +/- {np.nanstd(all_sft_a):.4f} | "
               f"Soft --compare_path: {np.nanmean(all_sft_b):.4f} +/- {np.nanstd(all_sft_b):.4f}",
               flush=True)
+        for metric, values in [('coherence/path', all_coh_a), ('coherence/compare', all_coh_b),
+                               ('focus/path', all_foc_a), ('focus/compare', all_foc_b),
+                               ('soft/path', all_sft_a), ('soft/compare', all_sft_b)]:
+            tracker.summary[f'{metric}_mean'] = float(np.nanmean(values))
+            tracker.summary[f'{metric}_std'] = float(np.nanstd(values))
+        tracker.finish()
         return
 
     # --- single-model mode ---
@@ -391,11 +405,17 @@ def run_experiment(path, dataset_dir):
 
         print(f"Run:{run+1} | Soft:{run_soft[-1]:.4f} | Coherence:{run_coherence[-1]:.4f}"
               f"  E:{(time.time()-t0)/60:.2f}min", flush=True)
+        tracker.log({'seed': run, 'soft': run_soft[-1], 'coherence': run_coherence[-1]})
 
     print(f"SUMMARY (n={len(run_soft)}) | "
           f"Soft: {np.mean(run_soft):.4f} +/- {np.std(run_soft):.4f} | "
           f"Coherence: {np.nanmean(run_coherence):.4f} +/- {np.nanstd(run_coherence):.4f}",
           flush=True)
+    tracker.summary['soft_mean'] = float(np.mean(run_soft))
+    tracker.summary['soft_std'] = float(np.std(run_soft))
+    tracker.summary['coherence_mean'] = float(np.nanmean(run_coherence))
+    tracker.summary['coherence_std'] = float(np.nanstd(run_coherence))
+    tracker.finish()
 
 
 def main(argv=None):

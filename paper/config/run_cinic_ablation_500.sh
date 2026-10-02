@@ -11,52 +11,27 @@
 # 5 (SupCon+MW frozen). Cells 4 and 6 (fine-tune) are intentionally skipped
 # to save compute, matching the SVHN-500 sweep.
 #
-# PREREQUISITES (run once before this script):
-#   1. Stage CINIC-10 into /dev/shm and create the model symlink:
+# PREREQUISITE: stage the dataset once with `bash config/setup_cinic.sh`.
 #
-#      bash config/setup_cinic.sh
+# Pretrains one SupCon encoder per seed first (batch 64, lr 0.5 * 64 / 256 =
+# 0.125). Sanity-check the [diag ep1/batch1] line in each pretrain log:
+# per_dim_std should be well above 0 and mean_cos well below 1.0. If you see
+# collapse, retry with --projection_bn=True or a smaller --lr.
 #
-#   2. Pretrain a SupCon encoder on the SAME 500-image subset downstream
-#      will see (same-data-budget). Batch 64 because batch 256 + drop_last
-#      on 500 samples gives only 1 SGD step/epoch. LR follows the
-#      SupCon/SimCLR linear scaling rule (lr = base_lr * batch / 256).
-#      Original CINIC-2000 used batch=256, lr=0.5; at batch=64 we use
-#      lr=0.125.
-#
-#      python -u pretrain_supcon.py \
-#          --dataset=CINIC10 --loss=supcon --model=mobilenet \
-#          --train_examples=500 --seed=1 \
-#          --epochs=300 --batch_size=64 \
-#          --lr=0.125 --temperature=0.07 --projection_dim=0 \
-#          2>&1 | tee /root/cinic_run_500/logs/00_pretrain_cinic_500.txt
-#
-#      Output: models/CINIC10/supcon/mobilenet/500/1.pt
-#
-#      Sanity-check the [diag ep1/batch1] line in the log: per_dim_std
-#      should be well above 0 and mean_cos well below 1.0. If you see
-#      collapse, retry with --projection_bn=True or a smaller --lr.
-#
-# WARNING: at 300 epochs and 5 runs per cell, this sweep is ~7.5x longer
-#   per cell than the SVHN-40-epoch version even though each epoch is fast
-#   (only 7 batches at batch=64). Run inside tmux.
+# WARNING: at 300 epochs per stage this sweep is much longer than the SVHN
+#   40-epoch version, and pretraining now runs once per seed. Run inside
+#   tmux. Extra arguments are passed to every python call, e.g. --wandb.
 # ============================================================================
 
 set -e
 set -o pipefail  # make `python ... | tee ...` propagate python's exit status
-cd /workspace/memory-wrap-SENN/paper
+cd "$(dirname "$0")/.."
 
-ENC=models/CINIC10/supcon/mobilenet/500/1.pt
-LOG=/root/cinic_run_500/logs
+ENC=models/CINIC10/supcon/mobilenet/500
+LOG=logs/cinic_500
 YAML=config/train.yaml
 
 mkdir -p "$LOG"
-
-# Verify encoder exists before launching downstream sweep
-if [ ! -f "$ENC" ]; then
-    echo "ERROR: pretrained CINIC10-500 encoder not found at $ENC." >&2
-    echo "Run pretrain_supcon.py first (see header of this script)." >&2
-    exit 1
-fi
 
 # Verify dataset is staged (setup_cinic.sh creates this symlink).
 if [ ! -d datasets/CINIC10/train ]; then
@@ -83,22 +58,28 @@ restore_yaml() {
 }
 trap restore_yaml EXIT
 
+RUNS=$(awk '/^runs:/ {print $2}' "$YAML")
+bash config/pretrain_encoders.sh "$ENC" "$RUNS" "$LOG" \
+    --dataset=CINIC10 --loss=supcon --model=mobilenet \
+    --train_examples=500 --epochs=300 --batch_size=64 \
+    --lr=0.125 --temperature=0.07 --projection_dim=0 "$@"
+
 echo "===== Cell 1: Scratch + Linear ====="
-python -u train.py --modality=std \
+python -u train.py --modality=std "$@" \
     2>&1 | tee $LOG/01_scratch_linear.txt
 
 echo "===== Cell 2: Scratch + MW ====="
-python -u train.py --modality=encoder_memory \
+python -u train.py --modality=encoder_memory "$@" \
     2>&1 | tee $LOG/02_scratch_mw.txt
 
 echo "===== Cell 3: SupCon + Linear (frozen) ====="
-python -u train.py --modality=std --pretrained_encoder=$ENC --freeze_encoder=True \
+python -u train.py --modality=std --pretrained_encoder=$ENC --freeze_encoder=True "$@" \
     2>&1 | tee $LOG/03_supcon_linear_frozen.txt
 
 # Cell 4 (SupCon + Linear fine-tune) intentionally skipped.
 
 echo "===== Cell 5: SupCon + MW (frozen) ====="
-python -u train.py --modality=encoder_memory --pretrained_encoder=$ENC --freeze_encoder=True \
+python -u train.py --modality=encoder_memory --pretrained_encoder=$ENC --freeze_encoder=True "$@" \
     2>&1 | tee $LOG/05_supcon_mw_frozen.txt
 
 # Cell 6 (SupCon + MW fine-tune) intentionally skipped.

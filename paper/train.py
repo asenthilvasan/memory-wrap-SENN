@@ -6,6 +6,7 @@ import absl.app
 import os
 import yaml
 import utils.utils as utils
+import utils.tracking as tracking
 import time
 import pickle
 from typing import List
@@ -17,15 +18,55 @@ absl.flags.DEFINE_string("modality", None, "std, memory or encoder_memory")
 absl.flags.DEFINE_bool("continue_train", False, "std, memory or mlp")
 absl.flags.DEFINE_integer("log_interval",100,"Log interval between prints during training process")
 absl.flags.DEFINE_string("pretrained_encoder", None,
-    "Optional path to a SupCon-pretrained encoder checkpoint (produced by pretrain_supcon.py). "
-    "If set, the encoder weights are loaded before training begins.")
+    "Optional directory of per-seed encoders from pretrain_supcon.py "
+    "(e.g. models/SVHN/supcon/mobilenet/2000). Run N loads seedN.pt from it.")
 absl.flags.DEFINE_bool("freeze_encoder", False,
-    "If True, freeze all parameters except the Memory Wrap head (self.mw.*). "
+    "If True, freeze all parameters except the classification head. "
     "Typically used together with --pretrained_encoder to do linear-probe style training.")
 absl.flags.mark_flag_as_required("modality")
 FLAGS = absl.flags.FLAGS
 
-def train_memory_model(model:torch.nn.Module,loaders:List[torch.utils.data.DataLoader],optimizer:torch.optim.Optimizer,scheduler:torch.optim.lr_scheduler._LRScheduler,loss_criterion:torch.nn.modules.loss, num_epochs:int,device:torch.device)->torch.nn.Module:
+# Parameter-name prefixes of the classification head across model variants
+# (mw = Memory Wrap, linear = std MobileNetV2, the rest = other backbones).
+HEAD_PREFIXES = ('mw.', 'linear.', 'classifier.', 'fc.', 'head.')
+
+
+def load_pretrained_encoder(model:torch.nn.Module, encoder_dir:str, seed:int, config:dict):
+    """Load the encoder that was pretrained on this run's training subset.
+
+    Each run trains on a different seeded subset, so it must load the encoder
+    pretrained with the same seed. Any other encoder has seen labels from a
+    different subset, which gives the run extra labeled data.
+
+    Raises:
+        FileNotFoundError: if there is no encoder for this seed.
+        ValueError: if the encoder was pretrained on a different subset.
+        RuntimeError: if the encoder weights do not match the model.
+    """
+    path = os.path.join(encoder_dir, f'seed{seed}.pt')
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'No pretrained encoder for seed {seed}: {path}')
+    ckpt = torch.load(path, map_location='cpu')
+
+    expected = {'dataset_name': config['dataset_name'],
+                'train_examples': config['train_examples'],
+                'seed': seed}
+    found = {key: ckpt.get(key) for key in expected}
+    if found != expected:
+        raise ValueError(f'{path} was pretrained with {found}, but this run needs {expected}.')
+
+    # Pretraining never trains the head, so keep this run's freshly initialized one.
+    encoder_state = {k: v for k, v in ckpt['model_state_dict'].items()
+                     if not k.startswith(HEAD_PREFIXES)}
+    missing, unexpected = model.load_state_dict(encoder_state, strict=False)
+    missing = [k for k in missing if not k.startswith(HEAD_PREFIXES)]
+    if missing or unexpected:
+        raise RuntimeError(f'Encoder weights in {path} do not match {type(model).__name__}. '
+                           f'Missing: {missing}. Unexpected: {unexpected}.')
+    print(f'Loaded pretrained encoder {path}', flush=True)
+
+
+def train_memory_model(model:torch.nn.Module,loaders:List[torch.utils.data.DataLoader],optimizer:torch.optim.Optimizer,scheduler:torch.optim.lr_scheduler._LRScheduler,loss_criterion:torch.nn.modules.loss, num_epochs:int,device:torch.device,tracker=None)->torch.nn.Module:
     """ Function to train a model with a Memory Wrap layer (in the paper both
     the baseline variant and Memory Wrap)
 
@@ -43,17 +84,19 @@ def train_memory_model(model:torch.nn.Module,loaders:List[torch.utils.data.DataL
             the loss
         num_epochs (int): number of epoch to train the model
         device (torch.device): device where the model is stored
+        tracker: W&B run (or no-op) that receives per-epoch metrics
 
     Returns:
         torch.nn.Module: the trained model
     """
     train_loader, mem_loader = loaders
-    
-    # training process 
+
+    # training process
     model.train()
 
     scaler = torch.cuda.amp.GradScaler()
     for epoch in range(1, num_epochs + 1):
+        epoch_loss = 0.0
         for batch_idx, (data, y) in enumerate(train_loader):
             
             optimizer.zero_grad()
@@ -71,6 +114,7 @@ def train_memory_model(model:torch.nn.Module,loaders:List[torch.utils.data.DataL
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            epoch_loss += loss.item()
 
 
             #log stuff
@@ -79,14 +123,20 @@ def train_memory_model(model:torch.nn.Module,loaders:List[torch.utils.data.DataL
                 epoch,
                 100. * batch_idx / len(train_loader), len(train_loader.dataset)),end='\r')
 
+        log_epoch('memory', epoch, num_epochs, epoch_loss / len(train_loader), optimizer, tracker)
         scheduler.step()# increase scheduler step for each epoch
-        # Per-epoch heartbeat for log tailing. flush=True ensures the line
-        # appears immediately when stdout is redirected to a file.
-        print(f'[memory] Epoch {epoch}/{num_epochs}  loss={loss.item():.4f}', flush=True)
 
     return model
 
-def train_std_model(model:torch.nn.Module,train_loader:torch.utils.data.DataLoader,optimizer:torch.optim.Optimizer,scheduler:torch.optim.lr_scheduler._LRScheduler, loss_criterion:torch.nn.modules.loss, num_epochs:int, device:torch.device=torch.device('cpu'))->torch.nn.Module:
+
+def log_epoch(tag:str, epoch:int, num_epochs:int, mean_loss:float, optimizer:torch.optim.Optimizer, tracker):
+    """Print a per-epoch heartbeat and send the same metrics to W&B."""
+    lr = optimizer.param_groups[0]['lr']
+    print(f'[{tag}] Epoch {epoch}/{num_epochs}  loss={mean_loss:.4f}  lr={lr:.4g}', flush=True)
+    if tracker is not None:
+        tracker.log({'train/loss': mean_loss, 'train/lr': lr, 'epoch': epoch})
+
+def train_std_model(model:torch.nn.Module,train_loader:torch.utils.data.DataLoader,optimizer:torch.optim.Optimizer,scheduler:torch.optim.lr_scheduler._LRScheduler, loss_criterion:torch.nn.modules.loss, num_epochs:int, device:torch.device=torch.device('cpu'),tracker=None)->torch.nn.Module:
     """ Function to train standard models
 
     Args:
@@ -100,15 +150,17 @@ def train_std_model(model:torch.nn.Module,train_loader:torch.utils.data.DataLoad
             the loss
         num_epochs (int): number of epoch to train the model
         device (torch.device): device where the model is stored
+        tracker: W&B run (or no-op) that receives per-epoch metrics
 
     Returns:
         torch.nn.Module: the trained model
     """
     # training process
-    model.train()  
+    model.train()
     scaler = torch.cuda.amp.GradScaler()
-    for epoch in range(1, num_epochs + 1):      
-        for batch_idx, (data, y) in enumerate(train_loader): 
+    for epoch in range(1, num_epochs + 1):
+        epoch_loss = 0.0
+        for batch_idx, (data, y) in enumerate(train_loader):
             optimizer.zero_grad() 
             # input
             data = data.to(device)
@@ -126,16 +178,15 @@ def train_std_model(model:torch.nn.Module,train_loader:torch.utils.data.DataLoad
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            epoch_loss += loss.item()
             # log stuff
             if batch_idx % FLAGS.log_interval == 0:
                 print('Train Epoch: {} [({:.0f}%({})]\t'.format(
                 epoch,
                 100. * batch_idx / len(train_loader), len(train_loader.dataset)),end='\r')
-        
+
+        log_epoch('std', epoch, num_epochs, epoch_loss / len(train_loader), optimizer, tracker)
         scheduler.step() # increase scheduler step for each epoch
-        # Per-epoch heartbeat for log tailing. flush=True ensures the line
-        # appears immediately when stdout is redirected to a file.
-        print(f'[std] Epoch {epoch}/{num_epochs}  loss={loss.item():.4f}', flush=True)
 
     return model
 
@@ -204,21 +255,20 @@ def run_experiment(config:dict,modality:str):
         utils.set_seed(run)
         model = utils.get_model(config['model'],num_classes,model_type=modality)
         model = model.to(device)
+        tracker = tracking.init(
+            name=f'{modality_dir}-seed{run}',
+            group=f'{dataset_name}-{config["train_examples"]}-{modality_dir}',
+            job_type='train',
+            config={**config, 'modality': modality, 'seed': run,
+                    'pretrained_encoder': FLAGS.pretrained_encoder,
+                    'freeze_encoder': FLAGS.freeze_encoder})
 
-        # Optional SupCon-pretrained encoder + optional freeze (linear probe).
+        # Optional pretrained encoder + optional freeze (linear probe).
         if FLAGS.pretrained_encoder:
-            ckpt = torch.load(FLAGS.pretrained_encoder, map_location=device)
-            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            load_pretrained_encoder(model, FLAGS.pretrained_encoder, run, config)
         if FLAGS.freeze_encoder:
-            # Keep the classification head trainable; freeze everything else.
-            # Different model variants name the head differently:
-            #   - std MobileNetV2          -> self.linear
-            #   - MemoryMobileNetV2        -> self.mw
-            #   - EncoderMemoryMobileNetV2 -> self.mw
-            #   - torchvision-style nets   -> self.classifier / self.fc / self.head
-            HEAD_PREFIXES = ('mw.', 'linear.', 'classifier.', 'fc.', 'head.')
             for n, p in model.named_parameters():
-                if not any(n.startswith(pref) for pref in HEAD_PREFIXES):
+                if not n.startswith(HEAD_PREFIXES):
                     p.requires_grad_(False)
             trainable = [p for p in model.parameters() if p.requires_grad]
             if not trainable:
@@ -239,7 +289,7 @@ def run_experiment(config:dict,modality:str):
 
          # training process
         if modality == 'memory' or modality == 'encoder_memory':
-            model = train_memory_model(model,[train_loader,mem_loader],optimizer,scheduler,loss_criterion,config[dataset_name]['num_epochs'],device=device)  
+            model = train_memory_model(model,[train_loader,mem_loader],optimizer,scheduler,loss_criterion,config[dataset_name]['num_epochs'],device=device,tracker=tracker)
             train_time = time.time()
 
             cum_acc =  []
@@ -252,6 +302,7 @@ def run_experiment(config:dict,modality:str):
             for eval_idx in range(5):
                 best_acc, best_loss = utils.eval_memory(model,test_loader, mem_loader,loss_criterion,device)
                 cum_acc.append(best_acc)
+                tracker.log({'eval/acc': float(best_acc), 'eval/pass': eval_idx + 1})
                 print(f'[eval] {eval_idx+1}/5 acc={best_acc:.2f}  '
                       f'loss={best_loss:.4f}  elapsed={(time.time()-init_eval_time)/60:.1f}min',
                       flush=True)
@@ -259,7 +310,7 @@ def run_experiment(config:dict,modality:str):
             end_eval_time = time.time()
 
         else:
-            model = train_std_model(model,train_loader,optimizer,scheduler,loss_criterion,config[dataset_name]['num_epochs'],device)
+            model = train_std_model(model,train_loader,optimizer,scheduler,loss_criterion,config[dataset_name]['num_epochs'],device,tracker=tracker)
             train_time = time.time()
             init_eval_time = time.time()
             best_acc, best_loss  = utils.eval_std(model,test_loader,loss_criterion,device)
@@ -267,6 +318,9 @@ def run_experiment(config:dict,modality:str):
 
         # stats
         run_acc.append(best_acc)
+        tracker.summary['test/acc'] = float(best_acc)
+        tracker.summary['test/loss'] = float(best_loss)
+        tracker.finish()
 
         # save
         if save and path_saving_model:
@@ -276,7 +330,8 @@ def run_experiment(config:dict,modality:str):
             'train_examples': config['train_examples'],
             'mem_examples':  config[config['dataset_name']]['mem_examples'],
             'model_name': config['model'],
-            'num_classes': num_classes, 'modality':modality, 'dataset_name':config['dataset_name']} , save_path)
+            'num_classes': num_classes, 'modality':modality, 'dataset_name':config['dataset_name'],
+            'seed': run, 'pretrained_encoder': FLAGS.pretrained_encoder} , save_path)
             info = {'run_num':run+1,'accuracies':run_acc}
             pickle.dump( info, open( path_saving_model+"conf.p", "wb" ) )
 
