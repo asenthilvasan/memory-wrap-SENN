@@ -49,7 +49,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 # F provides L2 normalization (F.normalize); we need unit vectors because
 # SupCon works on cosine similarity = dot product of L2-normalized features.
 import torch.nn.functional as F
-from torchvision import datasets, transforms
+from torchvision import datasets
 # Reuse the existing model factory so SupCon-pretrained checkpoints use the
 # exact same backbone as downstream Memory Wrap training.
 import utils.utils as utils
@@ -60,7 +60,7 @@ import utils.tracking as tracking
 # when --train_examples matches config/train.yaml's train_examples, the
 # pretraining sees the EXACT SAME image indices as downstream, i.e. a fair
 # same-data-budget comparison instead of pretraining on the full dataset.
-from utils.datasets import split_dataset
+from utils.datasets import contrastive_augmentation, split_dataset
 
 
 # --- CLI flags ---------------------------------------------------------------
@@ -309,30 +309,10 @@ def main(argv):
         config={f.name: f.value for f in FLAGS.get_flags_for_module(sys.argv[0])})
 
     # --- Augmentation pipeline ----------------------------------------------
-    # SimCLR-style augmentations. They have to be strong enough that two
-    # views of the same image look meaningfully different (otherwise the
-    # encoder just learns a trivial identity-ish mapping), but not so strong
-    # that class-identifying content is destroyed. Built conditionally from
-    # the dataset spec (SVHN skips horizontal flip).
-    aug_list = [
-        # Random crop + resize: forces spatial invariance. scale=(0.2, 1.0)
-        # means crops can be as small as 20% of the original area.
-        transforms.RandomResizedCrop(32, scale=(0.2, 1.0)),
-    ]
-    if spec['hflip']:
-        aug_list.append(transforms.RandomHorizontalFlip())
-    aug_list += [
-        # ColorJitter with p=0.8: aggressive color perturbation. Critical
-        # for preventing the encoder from using color shortcuts.
-        transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
-        # 20% chance of converting to grayscale — another anti-color-shortcut.
-        transforms.RandomGrayscale(p=0.2),
-        transforms.ToTensor(),
-        # Per-channel normalization that matches paper/utils/datasets.py so
-        # downstream Memory Wrap training and eval see the same feature scale.
-        transforms.Normalize(spec['mean'], spec['std']),
-    ]
-    aug = transforms.Compose(aug_list)
+    # SimCLR-style augmentations: strong enough that two views of the same
+    # image look meaningfully different, but not so strong that class
+    # content is destroyed. Shared with train.py --augment.
+    aug = contrastive_augmentation(spec['mean'], spec['std'], spec['hflip'])
 
     # Dataset returns ((view1, view2), label) per sample thanks to TwoViews.
     # CINIC-10 uses ImageFolder (no torchvision auto-download); CIFAR-10/SVHN

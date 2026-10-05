@@ -23,6 +23,12 @@ absl.flags.DEFINE_string("pretrained_encoder", None,
 absl.flags.DEFINE_bool("freeze_encoder", False,
     "If True, freeze all parameters except the classification head. "
     "Typically used together with --pretrained_encoder to do linear-probe style training.")
+absl.flags.DEFINE_bool("augment", False,
+    "Train on SupCon's pretraining augmentations (SVHN only). Controls for "
+    "SupCon's augmentations when comparing against scratch.")
+absl.flags.DEFINE_string("tag", None,
+    "Optional suffix for the save directory and W&B group, e.g. 'ep80' for a "
+    "run whose config/train.yaml was changed.")
 absl.flags.mark_flag_as_required("modality")
 FLAGS = absl.flags.FLAGS
 
@@ -229,6 +235,10 @@ def run_experiment(config:dict,modality:str):
     # don't overwrite each other in the same models/ directory.
     if FLAGS.freeze_encoder:
         suffix += '_frozen'
+    if FLAGS.augment:
+        suffix += '_aug'
+    if FLAGS.tag:
+        suffix += f'_{FLAGS.tag}'
     modality_dir = FLAGS.modality + suffix
     path_saving_model = 'models/{}/{}/{}/{}/'.format(dataset_name,modality_dir, config['model'],config['train_examples'])
     if save and not os.path.isdir(path_saving_model): 
@@ -261,7 +271,8 @@ def run_experiment(config:dict,modality:str):
             job_type='train',
             config={**config, 'modality': modality, 'seed': run,
                     'pretrained_encoder': FLAGS.pretrained_encoder,
-                    'freeze_encoder': FLAGS.freeze_encoder})
+                    'freeze_encoder': FLAGS.freeze_encoder,
+                    'augment': FLAGS.augment, 'tag': FLAGS.tag})
 
         # Optional pretrained encoder + optional freeze (linear probe).
         if FLAGS.pretrained_encoder:
@@ -285,7 +296,7 @@ def run_experiment(config:dict,modality:str):
         else:
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,  milestones=opt_milestones)
         # get dataset
-        train_loader, _, test_loader, mem_loader = utils.get_loaders(config,run)
+        train_loader, _, test_loader, mem_loader = utils.get_loaders(config,run,augment=FLAGS.augment)
 
          # training process
         if modality == 'memory' or modality == 'encoder_memory':

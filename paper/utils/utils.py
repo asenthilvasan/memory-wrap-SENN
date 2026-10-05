@@ -162,7 +162,7 @@ def get_model(model_name: str, num_classes:int , model_type:str) -> torch.nn.Mod
    
     return model
 
-def get_loaders(config: dict, seed: int=42, balanced:bool=False)-> List[torch.utils.data.DataLoader]:
+def get_loaders(config: dict, seed: int=42, balanced:bool=False, augment:bool=False)-> List[torch.utils.data.DataLoader]:
     """ Retrieve the loaders (train, test, validation and memory) for
         the given dataset
 
@@ -172,6 +172,8 @@ def get_loaders(config: dict, seed: int=42, balanced:bool=False)-> List[torch.ut
             'train_examples',dataset_name->'mem_examples']
 
         seed (int, optional): Seed to ensure reproducibility. Defaults to 42.
+        augment (bool, optional): Augment training samples with the SupCon
+            pretraining augmentations. Only supported for SVHN.
 
     Returns:
         List[torch.utils.data.DataLoader]: List of loaders [train_loader, val_loader, test_loader, mem_loader]
@@ -188,8 +190,12 @@ def get_loaders(config: dict, seed: int=42, balanced:bool=False)-> List[torch.ut
         batch_size_train = train_examples
 
     #load data
+    if augment and dataset != 'SVHN':
+        raise ValueError(f'augment is only implemented for SVHN, not {dataset}.')
+    extra = {'augment': True} if augment else {}
+
     load_dataset = getattr(datasets, 'get_'+dataset, balanced)
-    loaders = load_dataset(data_dir,batch_size_train=batch_size_train, batch_size_test=batch_size_test,batch_size_memory=mem_examples,size_train=train_examples,seed=seed)
+    loaders = load_dataset(data_dir,batch_size_train=batch_size_train, batch_size_test=batch_size_test,batch_size_memory=mem_examples,size_train=train_examples,seed=seed,**extra)
     return loaders
 
 

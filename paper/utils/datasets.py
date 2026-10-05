@@ -110,8 +110,33 @@ def split_dataset(dataset:torch.utils.data.Dataset,train_size:int,val_size:int,s
 
 
 
+def contrastive_augmentation(mean:List[float], std:List[float], hflip:bool)->torchvision.transforms.Compose:
+    """SimCLR-style augmentation used for SupCon pretraining.
+
+    Downstream training can reuse it (train.py --augment) as a control that
+    separates the effect of SupCon's loss from the effect of its augmentations.
+
+    Args:
+        mean (List[float]): per-channel normalization mean
+        std (List[float]): per-channel normalization std
+        hflip (bool): add random horizontal flips (off for digits)
+    """
+    # Crops as small as 20% of the image force spatial invariance.
+    augmentations = [torchvision.transforms.RandomResizedCrop(32, scale=(0.2, 1.0))]
+    if hflip:
+        augmentations.append(torchvision.transforms.RandomHorizontalFlip())
+    augmentations += [
+        # Strong color perturbation and grayscale prevent color shortcuts.
+        torchvision.transforms.RandomApply([torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+        torchvision.transforms.RandomGrayscale(p=0.2),
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize(mean, std),
+    ]
+    return torchvision.transforms.Compose(augmentations)
+
+
 def get_SVHN(data_dir:str, batch_size_train:int, batch_size_test:int, batch_size_memory:int,
-             size_train:int=100000, balanced:bool=False, seed:int=42) -> List[torch.utils.data.DataLoader]:
+             size_train:int=100000, balanced:bool=False, seed:int=42, augment:bool=False) -> List[torch.utils.data.DataLoader]:
     """ Function to retrieve SVHN dataset and dataloader
 
     Args:
@@ -122,6 +147,8 @@ def get_SVHN(data_dir:str, batch_size_train:int, batch_size_test:int, batch_size
         size_train (int, optional): Number of samples in the whole training
              dataset. Defaults to 100000.
         seed (int, optional): Seed to ensure reproducibility. Defaults to 42.
+        augment (bool, optional): Apply contrastive_augmentation to training
+            samples. Memory samples stay unaugmented. Defaults to False.
 
     Returns:
         List[torch.utils.data.DataLoader]: Dataloaders for training, validation,
@@ -148,6 +175,13 @@ def get_SVHN(data_dir:str, batch_size_train:int, batch_size_test:int, batch_size
         mem_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size_memory, sampler = sampler, drop_last=True, pin_memory=True)     
     else:
         mem_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size_memory,pin_memory=True, shuffle=True, drop_last=True,worker_init_fn=seed_worker)
+
+    if augment:
+        # Same length and seed give the same split, so this is the same
+        # subset of images, just augmented.
+        augmented_data = torchvision.datasets.SVHN(data_dir, split='train', download=True,
+            transform=contrastive_augmentation([0.485, 0.456, 0.406], [0.229, 0.224, 0.225], hflip=False))
+        train_dataset, _ = split_dataset(augmented_data,size_train,6000,seed)
     train_loader = torch.utils.data.DataLoader( train_dataset, batch_size=batch_size_train,pin_memory=True, shuffle=True, drop_last=True,worker_init_fn=seed_worker)
 
     val_loader = torch.utils.data.DataLoader( val_dataset, batch_size=batch_size_test,pin_memory=True, shuffle=False,worker_init_fn=seed_worker)
