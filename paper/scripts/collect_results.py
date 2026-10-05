@@ -16,7 +16,8 @@ import re
 import numpy as np
 from scipy import stats
 
-_RUN_RE = re.compile(r"^Run:\s*(\d+)\s*\|.*?\|\s*Accuracy\s+([0-9.]+)\s*\|")
+# Search rather than match: '\r' progress output can share the line.
+_RUN_RE = re.compile(r"Run:\s*(\d+)\s*\|\s*Best Loss.*?\|\s*Accuracy\s+([0-9.]+)\s*\|")
 
 
 def parse_log(path):
@@ -25,7 +26,7 @@ def parse_log(path):
     runs = {}
     with open(path, errors='replace') as f:
         for line in f:
-            match = _RUN_RE.match(line.strip())
+            match = _RUN_RE.search(line)
             if match:
                 runs[int(match.group(1))] = float(match.group(2))
     return runs
