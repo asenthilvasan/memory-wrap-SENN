@@ -279,7 +279,9 @@ def render(state):
                  '**chosen**' if (r['lr'], r['epochs']) == (b['down'][c]['lr'], b['down'][c]['epochs']) else '')
                 for c in ('ULfz', 'UMfz', 'UMft') for r in b['down'][c]['grid']]
         out += [f'### Downstream after SupCon (pretraining {b["supcon"]["plateau"]} epochs)', '',
-                grid_table(rows, ['cell', 'lr', 'epochs', 'val acc', '']), '']
+                grid_table(rows, ['cell', 'lr', 'epochs', 'val acc', '']), '',
+                'Frozen cells: the chosen lr was also run at half and twice the epochs, and the budget '
+                f'was picked by the plateau rule (smallest within {PLATEAU_PP} pp of the best).', '']
         out += ['### Final settings (fixed before any test run)', '']
         rows = [(CELL_NAMES.get(c, 'SupCon pretraining'), s['desc']) for c, s in state['final_settings'].items()]
         out += [grid_table(rows, ['cell', 'settings']), '']
@@ -379,6 +381,19 @@ def stage_b(pool, state):
         scores = {g: res[(c, g)] for g in grid}
         lr, ep = best(scores)
         b['down'][c] = {'lr': lr, 'epochs': ep, 'grid': [{'lr': g[0], 'epochs': g[1], 'accs': v} for g, v in scores.items()]}
+
+    # Frozen heads: rerun the chosen lr at half and twice the epochs
+    # (20 and 80 around 40) and pick the budget by the plateau rule.
+    futs = {(c, scale): pool.submit(down_job, c, tag, b['down'][c]['lr'], int(b['down'][c]['epochs'] * scale))
+            for c in ('ULfz', 'UMfz') for scale in (0.5, 2)}
+    for c in ('ULfz', 'UMfz'):
+        d = b['down'][c]
+        by_budget = {d['epochs']: res[(c, (d['lr'], d['epochs']))]}
+        for scale in (0.5, 2):
+            epochs = int(d['epochs'] * scale)
+            by_budget[epochs] = futs[(c, scale)].result()
+            d['grid'].append({'lr': d['lr'], 'epochs': epochs, 'accs': by_budget[epochs], 'budget_check': True})
+        d['epochs'] = plateau(by_budget)
     final = {}
     for head in ('SL', 'SM'):
         final[head] = {'lr': a[head]['lr'], 'wd': a[head]['wd'], 'epochs': b[head]['plateau']}
