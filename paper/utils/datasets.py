@@ -180,7 +180,7 @@ def get_SVHN(data_dir:str, batch_size_train:int, batch_size_test:int, batch_size
         # Same length and seed give the same split, so this is the same
         # subset of images, just augmented.
         augmented_data = torchvision.datasets.SVHN(data_dir, split='train', download=True,
-            transform=contrastive_augmentation([0.485, 0.456, 0.406], [0.229, 0.224, 0.225], hflip=False))
+            transform=contrastive_augmentation(normalize.mean, normalize.std, hflip=False))
         train_dataset, _ = split_dataset(augmented_data,size_train,6000,seed)
     train_loader = torch.utils.data.DataLoader( train_dataset, batch_size=batch_size_train,pin_memory=True, shuffle=True, drop_last=True,worker_init_fn=seed_worker)
 
