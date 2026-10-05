@@ -109,6 +109,24 @@ def split_dataset(dataset:torch.utils.data.Dataset,train_size:int,val_size:int,s
     return train_dataset, val_dataset
 
 
+def holdout_split(subset:torch.utils.data.Dataset,holdout_size:int,seed:int)->List[torch.utils.data.Dataset]:
+    """ Function to hold out validation images from a training subset.
+    The subset itself is unchanged, so runs with and without a holdout use the
+    same images for a given seed.
+    Args:
+        subset (torch.utils.data.Dataset): training subset from split_dataset
+        holdout_size (int): Number of samples to hold out (0 = none)
+        seed (int): Seed to fix split for reproducibility
+    Returns:
+        List[torch.utils.data.Dataset]: The remaining training samples and the
+            held out samples (None when holdout_size is 0)
+    """
+    if holdout_size == 0:
+        return subset, None
+    train_part, holdout = torch.utils.data.random_split(subset,[len(subset)-holdout_size,holdout_size],generator=torch.Generator().manual_seed(seed))
+    return train_part, holdout
+
+
 
 def contrastive_augmentation(mean:List[float], std:List[float], hflip:bool)->torchvision.transforms.Compose:
     """SimCLR-style augmentation used for SupCon pretraining.
@@ -136,7 +154,8 @@ def contrastive_augmentation(mean:List[float], std:List[float], hflip:bool)->tor
 
 
 def get_SVHN(data_dir:str, batch_size_train:int, batch_size_test:int, batch_size_memory:int,
-             size_train:int=100000, balanced:bool=False, seed:int=42, augment:bool=False) -> List[torch.utils.data.DataLoader]:
+             size_train:int=100000, balanced:bool=False, seed:int=42, augment:bool=False,
+             val_examples:int=0) -> List[torch.utils.data.DataLoader]:
     """ Function to retrieve SVHN dataset and dataloader
 
     Args:
@@ -149,6 +168,10 @@ def get_SVHN(data_dir:str, batch_size_train:int, batch_size_test:int, batch_size
         seed (int, optional): Seed to ensure reproducibility. Defaults to 42.
         augment (bool, optional): Apply contrastive_augmentation to training
             samples. Memory samples stay unaugmented. Defaults to False.
+        val_examples (int, optional): Hold out this many of the size_train
+            images as the validation set. Training and memory samples come
+            from the rest. 0 keeps the 6000-image validation set outside the
+            subset. Defaults to 0.
 
     Returns:
         List[torch.utils.data.DataLoader]: Dataloaders for training, validation,
@@ -166,6 +189,8 @@ def get_SVHN(data_dir:str, batch_size_train:int, batch_size_test:int, batch_size
     train_data = torchvision.datasets.SVHN(data_dir, split='train', download=True, transform=transforms)
     test_data =  torchvision.datasets.SVHN(data_dir, split='test', download=True, transform=transforms)
     train_dataset, val_dataset = split_dataset(train_data,size_train,6000,seed)
+    if val_examples:
+        train_dataset, val_dataset = holdout_split(train_dataset,val_examples,seed)
 
     if balanced:
         # https://discuss.pytorch.org/t/balanced-sampling-between-classes-with-torchvision-dataloader/2703/3
@@ -182,6 +207,7 @@ def get_SVHN(data_dir:str, batch_size_train:int, batch_size_test:int, batch_size
         augmented_data = torchvision.datasets.SVHN(data_dir, split='train', download=True,
             transform=contrastive_augmentation(normalize.mean, normalize.std, hflip=False))
         train_dataset, _ = split_dataset(augmented_data,size_train,6000,seed)
+        train_dataset, _ = holdout_split(train_dataset,val_examples,seed)
     train_loader = torch.utils.data.DataLoader( train_dataset, batch_size=batch_size_train,pin_memory=True, shuffle=True, drop_last=True,worker_init_fn=seed_worker)
 
     val_loader = torch.utils.data.DataLoader( val_dataset, batch_size=batch_size_test,pin_memory=True, shuffle=False,worker_init_fn=seed_worker)

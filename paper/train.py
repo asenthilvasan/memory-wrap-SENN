@@ -29,6 +29,13 @@ absl.flags.DEFINE_bool("augment", False,
 absl.flags.DEFINE_string("tag", None,
     "Optional suffix for the save directory and W&B group, e.g. 'ep80' for a "
     "run whose config/train.yaml was changed.")
+absl.flags.DEFINE_integer("val_examples", 0,
+    "Hold out this many of the train_examples images (SVHN only) and evaluate "
+    "on them instead of the test set. 0 trains on all images and evaluates on test.")
+absl.flags.DEFINE_multi_string("set", [],
+    "Override a config/train.yaml key, e.g. --set SVHN.num_epochs=160 "
+    "--set optimizer.learning_rate=0.03. Dotted keys reach nested values. "
+    "Overriding SVHN.num_epochs alone rescales opt_milestones to 50%/75%.")
 absl.flags.mark_flag_as_required("modality")
 FLAGS = absl.flags.FLAGS
 
@@ -56,8 +63,11 @@ def load_pretrained_encoder(model:torch.nn.Module, encoder_dir:str, seed:int, co
 
     expected = {'dataset_name': config['dataset_name'],
                 'train_examples': config['train_examples'],
+                'val_examples': FLAGS.val_examples,
                 'seed': seed}
     found = {key: ckpt.get(key) for key in expected}
+    # Checkpoints from before validation holdouts trained on every image.
+    found['val_examples'] = ckpt.get('val_examples', 0)
     if found != expected:
         raise ValueError(f'{path} was pretrained with {found}, but this run needs {expected}.')
 
@@ -70,6 +80,45 @@ def load_pretrained_encoder(model:torch.nn.Module, encoder_dir:str, seed:int, co
         raise RuntimeError(f'Encoder weights in {path} do not match {type(model).__name__}. '
                            f'Missing: {missing}. Unexpected: {unexpected}.')
     print(f'Loaded pretrained encoder {path}', flush=True)
+
+
+def set_train_mode(model:torch.nn.Module):
+    """Put the model in training mode, keeping a frozen encoder's BatchNorm
+    layers in eval mode so their running statistics stay as pretraining left
+    them (a true linear probe). The head keeps training mode."""
+    model.train()
+    if not FLAGS.freeze_encoder:
+        return
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm) and not name.startswith(HEAD_PREFIXES):
+            module.eval()
+
+
+def apply_overrides(config:dict, overrides:List[str]) -> dict:
+    """Apply --set key=value overrides to the YAML config in place.
+
+    Values are parsed as YAML, so numbers and lists keep their types. When the
+    epoch count is overridden without milestones, the milestones are rescaled
+    to 50% and 75% of training (the default 40 epochs -> [20, 30]).
+    """
+    keys = set()
+    for item in overrides:
+        key, sep, value = item.partition('=')
+        if not sep:
+            raise ValueError(f'--set expects key=value, got {item!r}')
+        *parents, leaf = key.split('.')
+        node = config
+        for parent in parents:
+            node = node[parent]
+        if leaf not in node:
+            raise KeyError(f'--set {key}: no such key in config/train.yaml')
+        node[leaf] = yaml.safe_load(value)
+        keys.add(key)
+    dataset_name = config['dataset_name']
+    if f'{dataset_name}.num_epochs' in keys and f'{dataset_name}.opt_milestones' not in keys:
+        epochs = config[dataset_name]['num_epochs']
+        config[dataset_name]['opt_milestones'] = [epochs // 2, 3 * epochs // 4]
+    return config
 
 
 def train_memory_model(model:torch.nn.Module,loaders:List[torch.utils.data.DataLoader],optimizer:torch.optim.Optimizer,scheduler:torch.optim.lr_scheduler._LRScheduler,loss_criterion:torch.nn.modules.loss, num_epochs:int,device:torch.device,tracker=None)->torch.nn.Module:
@@ -98,7 +147,7 @@ def train_memory_model(model:torch.nn.Module,loaders:List[torch.utils.data.DataL
     train_loader, mem_loader = loaders
 
     # training process
-    model.train()
+    set_train_mode(model)
 
     scaler = torch.cuda.amp.GradScaler()
     for epoch in range(1, num_epochs + 1):
@@ -162,7 +211,7 @@ def train_std_model(model:torch.nn.Module,train_loader:torch.utils.data.DataLoad
         torch.nn.Module: the trained model
     """
     # training process
-    model.train()
+    set_train_mode(model)
     scaler = torch.cuda.amp.GradScaler()
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
@@ -272,7 +321,8 @@ def run_experiment(config:dict,modality:str):
             config={**config, 'modality': modality, 'seed': run,
                     'pretrained_encoder': FLAGS.pretrained_encoder,
                     'freeze_encoder': FLAGS.freeze_encoder,
-                    'augment': FLAGS.augment, 'tag': FLAGS.tag})
+                    'augment': FLAGS.augment, 'tag': FLAGS.tag,
+                    'val_examples': FLAGS.val_examples})
 
         # Optional pretrained encoder + optional freeze (linear probe).
         if FLAGS.pretrained_encoder:
@@ -296,7 +346,10 @@ def run_experiment(config:dict,modality:str):
         else:
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,  milestones=opt_milestones)
         # get dataset
-        train_loader, _, test_loader, mem_loader = utils.get_loaders(config,run,augment=FLAGS.augment)
+        train_loader, val_loader, test_loader, mem_loader = utils.get_loaders(config,run,augment=FLAGS.augment,val_examples=FLAGS.val_examples)
+        # Search runs score on held-out training images and never touch test.
+        eval_split = 'val' if FLAGS.val_examples else 'test'
+        eval_loader = val_loader if FLAGS.val_examples else test_loader
 
          # training process
         if modality == 'memory' or modality == 'encoder_memory':
@@ -308,10 +361,10 @@ def run_experiment(config:dict,modality:str):
             # perform 5 times the validation to stabilize results (due to random selection of memory samples)
             init_eval_time = time.time()
             print(f'[eval] Starting 5x evaluation over '
-                  f'{len(test_loader.dataset)} test samples '
+                  f'{len(eval_loader.dataset)} {eval_split} samples '
                   f'(silent until each pass completes)...', flush=True)
             for eval_idx in range(5):
-                best_acc, best_loss = utils.eval_memory(model,test_loader, mem_loader,loss_criterion,device)
+                best_acc, best_loss = utils.eval_memory(model,eval_loader, mem_loader,loss_criterion,device)
                 cum_acc.append(best_acc)
                 tracker.log({'eval/acc': float(best_acc), 'eval/pass': eval_idx + 1})
                 print(f'[eval] {eval_idx+1}/5 acc={best_acc:.2f}  '
@@ -324,13 +377,13 @@ def run_experiment(config:dict,modality:str):
             model = train_std_model(model,train_loader,optimizer,scheduler,loss_criterion,config[dataset_name]['num_epochs'],device,tracker=tracker)
             train_time = time.time()
             init_eval_time = time.time()
-            best_acc, best_loss  = utils.eval_std(model,test_loader,loss_criterion,device)
+            best_acc, best_loss  = utils.eval_std(model,eval_loader,loss_criterion,device)
             end_eval_time = time.time()
 
         # stats
         run_acc.append(best_acc)
-        tracker.summary['test/acc'] = float(best_acc)
-        tracker.summary['test/loss'] = float(best_loss)
+        tracker.summary[f'{eval_split}/acc'] = float(best_acc)
+        tracker.summary[f'{eval_split}/loss'] = float(best_loss)
         tracker.finish()
 
         # save
@@ -342,7 +395,8 @@ def run_experiment(config:dict,modality:str):
             'mem_examples':  config[config['dataset_name']]['mem_examples'],
             'model_name': config['model'],
             'num_classes': num_classes, 'modality':modality, 'dataset_name':config['dataset_name'],
-            'seed': run, 'pretrained_encoder': FLAGS.pretrained_encoder} , save_path)
+            'seed': run, 'pretrained_encoder': FLAGS.pretrained_encoder,
+            'val_examples': FLAGS.val_examples} , save_path)
             info = {'run_num':run+1,'accuracies':run_acc}
             pickle.dump( info, open( path_saving_model+"conf.p", "wb" ) )
 
@@ -358,9 +412,10 @@ def run_experiment(config:dict,modality:str):
 def main(argv):
 
     config_file = open(r'config/train.yaml')
-    config = yaml.safe_load(config_file)
+    config = apply_overrides(yaml.safe_load(config_file), FLAGS.set)
 
-    print("Model:{}\nSizeTrain:{}\n".format(config['model'], config['train_examples']))
+    print("Model:{}\nSizeTrain:{}\nValExamples:{}\n".format(config['model'], config['train_examples'], FLAGS.val_examples))
+    print("Config:", config, flush=True)
     run_experiment(config, FLAGS.modality)
 
 if __name__ == '__main__':

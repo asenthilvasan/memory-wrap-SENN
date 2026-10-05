@@ -298,6 +298,10 @@ def _load_model_and_loaders(path, dataset_dir, device):
         run = int(name.split('.')[0]) - 1
         utils.set_seed(run)
         ckpt = torch.load(os.path.join(base, name), map_location=device)
+        if ckpt.get('val_examples', 0):
+            # Search checkpoints never saw their held-out images; memory sets
+            # drawn from the full subset would not match their training.
+            raise ValueError(f'{name} is a validation-search checkpoint; score final runs only.')
         model = utils.get_model(ckpt['model_name'], ckpt['num_classes'],
                                 model_type=ckpt['modality'])
         model.load_state_dict(ckpt['model_state_dict'])

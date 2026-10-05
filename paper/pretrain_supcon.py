@@ -60,7 +60,7 @@ import utils.tracking as tracking
 # when --train_examples matches config/train.yaml's train_examples, the
 # pretraining sees the EXACT SAME image indices as downstream, i.e. a fair
 # same-data-budget comparison instead of pretraining on the full dataset.
-from utils.datasets import contrastive_augmentation, split_dataset
+from utils.datasets import contrastive_augmentation, split_dataset, holdout_split
 
 
 # --- CLI flags ---------------------------------------------------------------
@@ -166,6 +166,14 @@ absl.flags.DEFINE_bool('projection_bn', False,
     'Insert BatchNorm1d between the first Linear and ReLU of the projection '
     'head. Mitigates dimensional collapse. Default off (matches SupCon/SimCLR '
     'reference); turn on if features collapse (loss sits at log(2B-1)).')
+# Validation holdout, matching train.py --val_examples. Pretraining for a
+# search run must not see the images that run is scored on.
+absl.flags.DEFINE_integer('val_examples', 0,
+    'Hold out this many of the --train_examples images (same split as '
+    'train.py --val_examples) and never load them. 0 = use all of them.')
+absl.flags.DEFINE_string('tag', None,
+    'Optional suffix for the budget directory, e.g. lr0.25_t0.1_ep80_val100 '
+    'saves to models/<dataset>/<loss>/<model>/<budget>_<tag>/.')
 FLAGS = absl.flags.FLAGS
 
 
@@ -302,6 +310,10 @@ def main(argv):
     torch.manual_seed(FLAGS.seed)
     spec = DATASET_SPECS[FLAGS.dataset]
     budget_dir = 'full' if FLAGS.train_examples == 0 else str(FLAGS.train_examples)
+    if FLAGS.val_examples and FLAGS.train_examples == 0:
+        raise ValueError('--val_examples needs --train_examples > 0.')
+    if FLAGS.tag:
+        budget_dir += f'_{FLAGS.tag}'
     tracker = tracking.init(
         name=f'{FLAGS.loss}-seed{FLAGS.seed}',
         group=f'{FLAGS.dataset}-{budget_dir}-{FLAGS.loss}-pretrain',
@@ -334,6 +346,10 @@ def main(argv):
         print(f'Subsetting to {len(ds)} samples (seed={FLAGS.seed}, '
               f'val_size={_VAL_SIZE[FLAGS.dataset]}) — matches downstream '
               f"train.py with train_examples={FLAGS.train_examples}.")
+        ds, _ = holdout_split(ds, FLAGS.val_examples, FLAGS.seed)
+        if FLAGS.val_examples:
+            print(f'Holding out {FLAGS.val_examples} validation images, '
+                  f'pretraining on {len(ds)}.', flush=True)
     # drop_last=True: SupCon needs a predictable 2B batch shape; dropping
     # the incomplete final batch avoids per-epoch shape edge cases.
     # persistent_workers=True: don't tear down and respawn worker processes
@@ -531,6 +547,7 @@ def main(argv):
                 'num_classes': 10, 'modality': f'{FLAGS.loss}_pretrained',
                 'dataset_name': FLAGS.dataset,
                 'train_examples': FLAGS.train_examples,
+                'val_examples': FLAGS.val_examples,
                 'seed': FLAGS.seed}, out)
     print(f'Saved {out}')
     tracker.finish()
